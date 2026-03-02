@@ -208,11 +208,14 @@ device = torch.device("cpu")
 
 model = CLoGNet()
 
-model.load_state_dict(torch.load("clognet_weights.pth", map_location=device))
+checkpoint = torch.load("clognet_weights.pth", map_location=device)
+
+model.load_state_dict(checkpoint["model_state"])
 
 model.to(device)
 
 model.eval()
+
 
 
 # ----------------------------- Transform -----------------------------
@@ -238,3 +241,4 @@ def predict_image(image: Image.Image):
     label = "Fake" if pred.item()==1 else "Real"
 
     return label, confidence.item()
+
