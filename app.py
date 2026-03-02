@@ -6,7 +6,8 @@ from io import BytesIO
 import torch
 from torchvision import transforms
 
-from model import CLoGNet   # import your model
+from model import CLoGNet   # correct import
+
 
 app = FastAPI()
 
@@ -24,7 +25,7 @@ model.eval()
 # Image preprocessing
 # -----------------------------
 transform = transforms.Compose([
-    transforms.Resize((224,224)),
+    transforms.Resize((299,299)),
     transforms.ToTensor(),
 ])
 
