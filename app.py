@@ -3,61 +3,21 @@ from pydantic import BaseModel
 import requests
 from PIL import Image
 from io import BytesIO
-import torch
-from torchvision import transforms
 
-from model import CLoGNet   # correct import
-
+from model import predict_image
 
 app = FastAPI()
 
-# -----------------------------
-# Load Model
-# -----------------------------
-device = torch.device("cpu")
 
-model = CLoGNet()
-model.load_state_dict(torch.load("clognet_weights.pth", map_location=device))
-model.to(device)
-model.eval()
-
-# -----------------------------
-# Image preprocessing
-# -----------------------------
-transform = transforms.Compose([
-    transforms.Resize((299,299)),
-    transforms.ToTensor(),
-])
-
-# -----------------------------
-# Request Schema
-# -----------------------------
 class ImageRequest(BaseModel):
     image_url: str
 
 
-# -----------------------------
-# Prediction Function
-# -----------------------------
-def run_model(image):
-
-    image = transform(image)
-    image = image.unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        outputs = model(image)
-        probs = torch.softmax(outputs, dim=1)
-
-    confidence, pred = torch.max(probs, dim=1)
-
-    label = "Fake" if pred.item() == 1 else "Real"
-
-    return label, confidence.item()
+@app.get("/")
+def home():
+    return {"message":"Deepfake detection API running"}
 
 
-# -----------------------------
-# API Endpoint
-# -----------------------------
 @app.post("/predict")
 def predict(req: ImageRequest):
 
@@ -65,7 +25,7 @@ def predict(req: ImageRequest):
 
     image = Image.open(BytesIO(response.content)).convert("RGB")
 
-    label, confidence = run_model(image)
+    label, confidence = predict_image(image)
 
     return {
         "prediction": label,
