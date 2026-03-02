@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torchvision import transforms
 from PIL import Image
 
-# ----------------------------- Basic building blocks -----------------------------
+# ----------------------------- Basic blocks -----------------------------
 class ConvBNAct(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=None, groups=1, act=True):
         super().__init__()
@@ -34,15 +34,15 @@ class DepthwiseSeparable(nn.Module):
         return self.pw(self.dw(x))
 
 
-# ----------------------------- Multi-scale stem ----------------------------------
+# ----------------------------- Multi-scale stem -----------------------------
 class MultiScaleStem(nn.Module):
-    def __init__(self, in_ch=3, out_ch=32):
+    def __init__(self, in_ch=3, out_ch=64):
         super().__init__()
 
         half = out_ch // 2
 
         self.conv3 = ConvBNAct(in_ch, half, kernel_size=3)
-        self.dw5 = ConvBNAct(in_ch, half, kernel_size=5, groups=min(in_ch, 3))
+        self.dw5 = ConvBNAct(in_ch, half, kernel_size=5, groups=3)
         self.conv1 = ConvBNAct(in_ch, half, kernel_size=1)
 
         self.project = ConvBNAct(half * 3, out_ch, kernel_size=1)
@@ -58,18 +58,14 @@ class MultiScaleStem(nn.Module):
         return self.project(cat)
 
 
-# ----------------------------- Local, Global, Channel Encoders ------------------
+# ----------------------------- Encoders -----------------------------
 class LocalEncoder(nn.Module):
-
-    def __init__(self, in_ch, out_ch, expansion=1.0):
-
+    def __init__(self, in_ch, out_ch):
         super().__init__()
 
-        mid = int(in_ch * expansion)
-
         self.block = nn.Sequential(
-            DepthwiseSeparable(in_ch, mid, kernel_size=3),
-            ConvBNAct(mid, out_ch, kernel_size=1)
+            DepthwiseSeparable(in_ch, in_ch),
+            ConvBNAct(in_ch, out_ch, kernel_size=1)
         )
 
     def forward(self, x):
@@ -77,18 +73,14 @@ class LocalEncoder(nn.Module):
 
 
 class GlobalEncoder(nn.Module):
-
-    def __init__(self, dim, pool_size=7, heads=4):
-
+    def __init__(self, dim, pool_size=7):
         super().__init__()
 
         self.pool_size = pool_size
-        self.heads = heads
-        self.scale = (dim // heads) ** -0.5 if dim >= heads else 1.0
 
-        self.to_q = nn.Conv2d(dim, dim, 1, bias=False)
-        self.to_k = nn.Conv2d(dim, dim, 1, bias=False)
-        self.to_v = nn.Conv2d(dim, dim, 1, bias=False)
+        self.to_q = nn.Conv2d(dim, dim, 1)
+        self.to_k = nn.Conv2d(dim, dim, 1)
+        self.to_v = nn.Conv2d(dim, dim, 1)
 
         self.out = nn.Conv2d(dim, dim, 1)
 
@@ -102,58 +94,40 @@ class GlobalEncoder(nn.Module):
         k = self.to_k(pooled).flatten(2)
         v = self.to_v(pooled).flatten(2)
 
-        attn = torch.bmm(q.transpose(1, 2), k) * self.scale
+        attn = torch.bmm(q.transpose(1,2), k)
         attn = attn.softmax(dim=-1)
 
-        out = torch.bmm(v, attn.transpose(1, 2)).view(b, c, self.pool_size, self.pool_size)
+        out = torch.bmm(v, attn.transpose(1,2)).view(b, c, self.pool_size, self.pool_size)
 
-        out = F.interpolate(self.out(out), size=(h, w), mode='bilinear', align_corners=False)
+        out = F.interpolate(self.out(out), size=(h,w), mode='bilinear', align_corners=False)
 
         return out
 
 
 class ChannelEncoder(nn.Module):
-
-    def __init__(self, channels, conv_kernel=3):
-
+    def __init__(self, channels):
         super().__init__()
 
         self.avg = nn.AdaptiveAvgPool2d(1)
-
-        padding = conv_kernel // 2
-
-        self.conv1d = nn.Conv1d(1, 1, kernel_size=conv_kernel, padding=padding, bias=False)
-
-        self.act = nn.Sigmoid()
-
-        self.expand = nn.Sequential(
-            nn.Conv2d(channels, channels, 1, bias=False),
-            nn.BatchNorm2d(channels)
-        )
+        self.conv1d = nn.Conv1d(1,1,3,padding=1)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
 
-        z = self.avg(x).squeeze(-1).transpose(1, 2)
-
+        z = self.avg(x).squeeze(-1).transpose(1,2)
         z = self.conv1d(z)
+        z = self.sigmoid(z).transpose(1,2).unsqueeze(-1)
 
-        z = self.act(z).transpose(1, 2).unsqueeze(-1)
-
-        out = x * z
-
-        return self.expand(out)
+        return x * z
 
 
-# ----------------------------- Cross Interaction --------------------------------
+# ----------------------------- Cross Interaction -----------------------------
 class CrossInteraction(nn.Module):
-
     def __init__(self, channels):
-
         super().__init__()
 
         self.modulator = nn.Sequential(
-            nn.Conv2d(channels * 3, channels, 1, bias=False),
-            nn.BatchNorm2d(channels),
+            nn.Conv2d(channels*3, channels, 1),
             nn.ReLU(),
             nn.Conv2d(channels, channels, 1),
             nn.Sigmoid()
@@ -162,89 +136,65 @@ class CrossInteraction(nn.Module):
     def forward(self, local, global_f, channel_f):
 
         cat = torch.cat([local, global_f, channel_f], dim=1)
-
         mod = self.modulator(cat)
 
-        return local * mod, global_f * mod, channel_f * mod
+        return local*mod, global_f*mod, channel_f*mod
 
 
-# ----------------------------- CLG Fusion Block ---------------------------------
+# ----------------------------- CLG Block -----------------------------
 class CLGFusionBlock(nn.Module):
-
-    def __init__(self, channels, pool_size=7, expansion=1.0):
-
+    def __init__(self, channels):
         super().__init__()
 
-        self.local = LocalEncoder(channels, channels, expansion)
-
-        self.global_enc = GlobalEncoder(channels, pool_size)
-
+        self.local = LocalEncoder(channels, channels)
+        self.global_enc = GlobalEncoder(channels)
         self.channel_enc = ChannelEncoder(channels)
 
         self.cross = CrossInteraction(channels)
 
-        self.fusion_logits = nn.Parameter(torch.tensor([1.0, 1.0, 1.0]))
+        self.fusion_logits = nn.Parameter(torch.tensor([1.0,1.0,1.0]))
 
-        self.norm = nn.BatchNorm2d(channels)
+    def forward(self,x):
 
-        self.project = ConvBNAct(channels, channels, 1)
+        l = self.local(x)
+        g = self.global_enc(x)
+        c = self.channel_enc(x)
 
-    def forward(self, x):
-
-        local_f = self.local(x)
-
-        global_f = self.global_enc(x)
-
-        channel_f = self.channel_enc(x)
-
-        local_m, global_m, channel_m = self.cross(local_f, global_f, channel_f)
+        l,g,c = self.cross(l,g,c)
 
         w = F.softmax(self.fusion_logits, dim=0)
 
-        fused = w[0] * local_m + w[1] * global_m + w[2] * channel_m
-
-        fused = self.project(self.norm(fused))
-
-        return F.gelu(fused + x)
+        return w[0]*l + w[1]*g + w[2]*c + x
 
 
-# ----------------------------- CLoGNet ------------------------------------------
+# ----------------------------- CLoGNet -----------------------------
 class CLoGNet(nn.Module):
 
-    def __init__(self, in_channels=3, num_classes=2, widths=[64, 96, 160], blocks=[1, 2, 2], pool_size=7):
+    def __init__(self, num_classes=2):
 
         super().__init__()
 
-        self.stem = MultiScaleStem(in_channels, widths[0])
+        self.stem = MultiScaleStem()
 
-        layers = []
+        self.body = nn.Sequential(
+            CLGFusionBlock(64),
+            nn.MaxPool2d(2),
 
-        in_ch = widths[0]
+            CLGFusionBlock(64),
+            nn.MaxPool2d(2),
 
-        for i, (w, n) in enumerate(zip(widths, blocks)):
-
-            if w != in_ch:
-                layers.append(ConvBNAct(in_ch, w, 1))
-                in_ch = w
-
-            for _ in range(n):
-                layers.append(CLGFusionBlock(in_ch, pool_size))
-
-            if i != len(widths) - 1:
-                layers.append(nn.MaxPool2d(2))
-
-        self.body = nn.Sequential(*layers)
+            CLGFusionBlock(64)
+        )
 
         self.head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(in_ch, in_ch // 2),
+            nn.Linear(64,32),
             nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(in_ch // 2, num_classes)
+            nn.Linear(32,num_classes)
         )
 
-    def forward(self, x):
+    def forward(self,x):
 
         x = self.stem(x)
         x = self.body(x)
@@ -253,24 +203,26 @@ class CLoGNet(nn.Module):
         return x
 
 
-# ----------------------------- Load Model ---------------------------------------
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ----------------------------- Load Model -----------------------------
+device = torch.device("cpu")
 
 model = CLoGNet()
+
 model.load_state_dict(torch.load("clognet_weights.pth", map_location=device))
+
 model.to(device)
+
 model.eval()
 
 
-# ----------------------------- Image Transform ----------------------------------
-
+# ----------------------------- Transform -----------------------------
 transform = transforms.Compose([
-    transforms.Resize((299,299)),
+    transforms.Resize((224,224)),
     transforms.ToTensor()
 ])
 
 
+# ----------------------------- Prediction -----------------------------
 def predict_image(image: Image.Image):
 
     image = transform(image).unsqueeze(0).to(device)
@@ -281,7 +233,7 @@ def predict_image(image: Image.Image):
 
         probs = torch.softmax(output, dim=1)
 
-        confidence, pred = torch.max(probs, 1)
+        confidence, pred = torch.max(probs,1)
 
     label = "Fake" if pred.item()==1 else "Real"
 
